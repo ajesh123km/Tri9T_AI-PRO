@@ -36,7 +36,7 @@ Copy `.env.example`. `DATABASE_URL` defaults to SQLite, and generated output use
 python -m unittest discover -s tests -v
 ```
 
-The suite uses deterministic mocked provider responses, temporary SQLite/JSON stores, and no external LLM calls. If the optional test dependency is installed, the same tests can also be run with `python -m pytest -q`. The supplied PDFs are regression fixtures. The implementation does not claim regulatory compliance or clinical validity.
+The suite uses deterministic mocked provider responses, temporary SQLite/JSON stores, and no external LLM calls. The HTTP workflow test uses FastAPI TestClient and can be enabled with `RUN_HTTP_TESTS=1` in an environment with a working local asyncio event loop. If the optional test dependency is installed, the same tests can also be run with `python -m pytest -q`. The supplied PDFs are regression fixtures. The implementation does not claim regulatory compliance or clinical validity.
 
 ## End-to-end demonstration
 

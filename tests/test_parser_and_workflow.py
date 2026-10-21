@@ -1,3 +1,4 @@
+import os
 import hashlib
 import json
 import tempfile
@@ -7,6 +8,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -271,4 +273,114 @@ class GenerationPipelineRegressionTests(unittest.TestCase):
             second = main.generate(self.selection.id, provider="mock", db=self.db)
         self.assertNotEqual(first["generation_id"], second["generation_id"])
         self.assertEqual(len(store._read()), 2)
+
+
+@unittest.skipUnless(os.getenv("RUN_HTTP_TESTS") == "1",
+                     "TestClient requires a runnable local asyncio event loop; set RUN_HTTP_TESTS=1")
+class HttpApiRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        Base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
+
+        def override_db():
+            db = self.Session()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        self.override_db = override_db
+        main.app.dependency_overrides[main.db_session] = override_db
+        self.client = TestClient(main.app)
+        self.store_path = ROOT / "tmp" / f"http-generation-{uuid4()}.json"
+
+    def tearDown(self):
+        self.client.close()
+        main.app.dependency_overrides.clear()
+        self.engine.dispose()
+        self.store_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _battery_node(nodes):
+        def walk(node):
+            if normalize(node["heading"]).startswith("2.1.1.1 battery"):
+                return node
+            for child in node.get("children", []):
+                found = walk(child)
+                if found:
+                    return found
+            return None
+        return next(found for top in nodes if (found := walk(top)))
+
+    def test_http_v1_v2_workflow_and_historical_retrieval(self):
+        self.assertEqual(self.client.get("/health").status_code, 200)
+        self.assertEqual(self.client.get("/docs").status_code, 200)
+
+        with (ROOT / "ct200_manual.pdf").open("rb") as source:
+            response = self.client.post("/documents/ingest", files={"file": ("ct200_manual.pdf", source, "application/pdf")})
+        self.assertEqual(response.status_code, 201)
+        first = response.json()
+        self.assertTrue(first["created"])
+
+        with (ROOT / "ct200_manual.pdf").open("rb") as source:
+            repeated = self.client.post("/documents/ingest", files={"file": ("ct200_manual.pdf", source, "application/pdf")})
+        self.assertEqual(repeated.status_code, 201)
+        self.assertFalse(repeated.json()["created"])
+        self.assertEqual(repeated.json()["version_id"], first["version_id"])
+
+        versions = self.client.get(f"/documents/{first['document_id']}/versions")
+        self.assertEqual(versions.status_code, 200)
+        self.assertEqual(len(versions.json()), 1)
+        sections = self.client.get(f"/documents/{first['document_id']}/sections", params={"version_id": first["version_id"]})
+        self.assertEqual(sections.status_code, 200)
+        section_tree = sections.json()
+        battery = self._battery_node(section_tree)
+        selected_nodes = [battery]
+        def collect_sections(node):
+            if node["node_type"] == "section" and node["id"] != battery["id"]:
+                selected_nodes.append(node)
+            for child in node.get("children", []):
+                if len(selected_nodes) < 3:
+                    collect_sections(child)
+        for top in section_tree:
+            if len(selected_nodes) < 3:
+                collect_sections(top)
+        self.assertEqual(len(selected_nodes), 3)
+        search = self.client.get(f"/documents/{first['document_id']}/search", params={"q": "Battery", "version_id": first["version_id"]})
+        self.assertEqual(search.status_code, 200)
+        self.assertTrue(search.json()["results"])
+        node = self.client.get(f"/nodes/{battery['id']}")
+        self.assertEqual(node.status_code, 200)
+        old_content = node.json()["content"]
+
+        selection = self.client.post("/selections", json={
+            "document_id": first["document_id"], "name": "HTTP v1 selection",
+            "items": [{"node_id": item["id"], "version_id": first["version_id"]} for item in selected_nodes],
+        })
+        self.assertEqual(selection.status_code, 201)
+        selection_id = selection.json()["selection_id"]
+
+        store = JsonGenerationStore(self.store_path)
+        with patch.object(main, "JsonGenerationStore", return_value=store):
+            generation = self.client.post(f"/generations?selection_id={selection_id}&provider=mock")
+            self.assertEqual(generation.status_code, 200)
+            self.assertEqual(len(generation.json()["test_cases"]), 3)
+            retrieved = self.client.get(f"/generations/{generation.json()['generation_id']}")
+            self.assertEqual(retrieved.status_code, 200)
+            self.assertEqual(retrieved.json()["source_versions"], [1])
+            self.assertEqual(len(store._read()), 1)
+
+        with (ROOT / "ct200_manual_v2.pdf").open("rb") as source:
+            second = self.client.post("/documents/ingest", files={"file": ("ct200_manual_v2.pdf", source, "application/pdf")})
+        self.assertEqual(second.status_code, 201)
+        comparison = self.client.get(f"/documents/{first['document_id']}/compare/{battery['logical_node_id']}",
+                                     params={"from_version": first["version_id"], "to_version": second.json()["version_id"]})
+        self.assertEqual(comparison.status_code, 200)
+        self.assertEqual(comparison.json()["status"], "changed")
+        historical = self.client.get(f"/selections/{selection_id}")
+        self.assertEqual(historical.status_code, 200)
+        self.assertEqual(historical.json()["items"][0]["version_number"], 1)
+        self.assertEqual(historical.json()["items"][0]["content"], old_content)
+        self.assertEqual(historical.json()["staleness"]["status"], "stale")
 
