@@ -1,12 +1,17 @@
 import os
 import hashlib
 import json
+import socket
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
+import httpx
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -14,7 +19,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.db import Base
-from app.models import Selection, SelectionItem, VersionNode
+from app.models import DocumentVersion, Selection, SelectionItem, VersionNode
 from app.parser import normalize, parse_pdf
 from app.schemas import TestCase
 from app.services import JsonGenerationStore, ingest_path, staleness
@@ -150,6 +155,23 @@ class VersionIngestionRegressionTests(unittest.TestCase):
             self.assertEqual(db.get(VersionNode, old.id).content, old.content)
             self.assertEqual(selection.items[0].version_node_id, old.id)
 
+    def test_removed_node_is_reported_from_synthetic_latest_version(self):
+        with self.Session() as db:
+            v1 = ingest_path(db, ROOT / "ct200_manual.pdf", "ct200_manual.pdf")
+            old = self._node(db.execute(select(VersionNode).where(VersionNode.version_id == v1["version_id"])).scalars().all(), "2.1.1.1 battery")
+            selection = Selection(document_id=v1["document_id"], name="removed requirement")
+            selection.items.append(SelectionItem(version_id=v1["version_id"], logical_node_id=old.logical_node_id,
+                                                 version_node_id=old.id, source_content_hash=old.content_hash))
+            db.add(selection)
+            removed_version = DocumentVersion(document_id=v1["document_id"], version_number=2,
+                                              source_filename="synthetic-v2.pdf",
+                                              source_sha256=hashlib.sha256(b"synthetic-v2").hexdigest())
+            db.add(removed_version)
+            db.commit()
+            result = staleness(db, selection)
+            self.assertEqual(result["status"], "source_removed")
+            self.assertIn(old.logical_node_id, result["removed_nodes"])
+
     def test_ambiguous_match_is_review_required_not_source_removed(self):
         with self.Session() as db:
             v1 = ingest_path(db, ROOT / "ct200_manual.pdf", "ct200_manual.pdf")
@@ -208,6 +230,37 @@ class GenerationPipelineRegressionTests(unittest.TestCase):
         provider = Provider()
         with self.assertRaises(ValueError): generate_with_retries(provider, "prompt", retries=2)
         self.assertEqual(provider.calls, 3)
+
+    def test_openai_compatible_provider_parses_structured_json(self):
+        from app.llm import OpenAICompatibleProvider
+        cases = [self._valid_case() for _ in range(3)]
+
+        class Response:
+            def raise_for_status(self): pass
+            def json(self): return {"choices": [{"message": {"content": json.dumps(cases)}}]}
+
+        with patch("app.llm.httpx.post", return_value=Response()) as request:
+            provider = OpenAICompatibleProvider("test-key", "test-model", "https://provider.test/chat")
+            self.assertEqual(provider.complete("prompt"), cases)
+        request.assert_called_once()
+        self.assertEqual(request.call_args.kwargs["headers"]["Authorization"], "Bearer test-key")
+
+    def test_openai_compatible_provider_rejects_malformed_json(self):
+        from app.llm import OpenAICompatibleProvider
+
+        class Response:
+            def raise_for_status(self): pass
+            def json(self): return {"choices": [{"message": {"content": "not-json"}}]}
+
+        with patch("app.llm.httpx.post", return_value=Response()):
+            with self.assertRaises(ValueError):
+                OpenAICompatibleProvider("test-key", "test-model", "https://provider.test/chat").complete("prompt")
+
+    def test_openai_compatible_provider_maps_timeout(self):
+        from app.llm import OpenAICompatibleProvider
+        with patch("app.llm.httpx.post", side_effect=httpx.TimeoutException("timed out")):
+            with self.assertRaises(TimeoutError):
+                OpenAICompatibleProvider("test-key", "test-model", "https://provider.test/chat").complete("prompt")
 
     def test_missing_fields_are_rejected(self):
         from app.llm import validate_cases
@@ -275,8 +328,8 @@ class GenerationPipelineRegressionTests(unittest.TestCase):
         self.assertEqual(len(store._read()), 2)
 
 
-@unittest.skipUnless(os.getenv("RUN_HTTP_TESTS") == "1",
-                     "TestClient requires a runnable local asyncio event loop; set RUN_HTTP_TESTS=1")
+@unittest.skipUnless(os.getenv("RUN_HTTP_TESTCLIENT") == "1",
+                     "in-process TestClient requires a runnable local asyncio event loop; set RUN_HTTP_TESTCLIENT=1")
 class HttpApiRegressionTests(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
@@ -383,4 +436,49 @@ class HttpApiRegressionTests(unittest.TestCase):
         self.assertEqual(historical.json()["items"][0]["version_number"], 1)
         self.assertEqual(historical.json()["items"][0]["content"], old_content)
         self.assertEqual(historical.json()["staleness"]["status"], "stale")
+
+
+@unittest.skipUnless(os.getenv("RUN_HTTP_TESTS") == "1",
+                     "real HTTP test requires RUN_HTTP_TESTS=1")
+class RealHttpApiRegressionTests(HttpApiRegressionTests):
+    """Run the same workflow against a real uvicorn process and httpx client."""
+
+    __unittest_skip__ = False
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory(dir=ROOT / "tmp")
+        temp_root = Path(self.tempdir.name)
+        self.store_path = temp_root / "generated.json"
+        self.db_path = temp_root / "database.sqlite"
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            self.port = probe.getsockname()[1]
+        environment = os.environ.copy()
+        environment.update({
+            "DATABASE_URL": f"sqlite:///{self.db_path.as_posix()}",
+            "GENERATED_STORE_PATH": str(self.store_path),
+            "LLM_PROVIDER": "mock",
+        })
+        self.server = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(self.port)],
+            cwd=ROOT, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self.client = httpx.Client(base_url=f"http://127.0.0.1:{self.port}", timeout=10)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                if self.client.get("/health").status_code == 200:
+                    return
+            except httpx.HTTPError:
+                time.sleep(0.2)
+        self.server.terminate()
+        self.server.wait(timeout=5)
+        self.fail("uvicorn did not become ready")
+
+    def tearDown(self):
+        self.client.close()
+        if self.server.poll() is None:
+            self.server.terminate()
+            self.server.wait(timeout=5)
+        self.tempdir.cleanup()
 

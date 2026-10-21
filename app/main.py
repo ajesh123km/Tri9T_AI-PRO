@@ -13,7 +13,7 @@ from .models import Document, DocumentVersion, LogicalNode, Selection, Selection
 from .parser import normalize, parse_pdf
 from .schemas import GenerationOut, NodeOut, SelectionIn, VersionOut
 from .services import JsonGenerationStore, build_mock_cases, selection_content, staleness
-from .llm import generate_with_retries
+from .llm import OpenAICompatibleProvider, generate_with_retries
 
 app = FastAPI(title="Tri9T AI CT-200 Document QA Service", version="0.1.0")
 
@@ -222,18 +222,25 @@ def generate(selection_id: str, provider: str | None = None, db: Session = Depen
         raise HTTPException(404, "Selection not found")
     sources = selection_content(db, selection)
     selected_provider = provider or settings.llm_provider
-    if selected_provider != "mock":
-        raise HTTPException(501, "Only explicit mock provider is bundled; configure an LLM adapter for production")
-
-    class MockProvider:
-        name = "mock"
-        def complete(self, prompt: str):
-            return [case.model_dump() for case in build_mock_cases(sources)]
+    if selected_provider == "mock":
+        class MockProvider:
+            name = "mock"
+            def complete(self, prompt: str):
+                return [case.model_dump() for case in build_mock_cases(sources)]
+        llm = MockProvider()
+    elif selected_provider in {"openai", "openai_compatible"}:
+        try:
+            llm = OpenAICompatibleProvider(settings.llm_api_key or "", settings.llm_model or "",
+                                           settings.llm_base_url, settings.llm_timeout_seconds)
+        except ValueError as exc:
+            raise HTTPException(503, str(exc)) from exc
+    else:
+        raise HTTPException(501, f"Unsupported LLM provider: {selected_provider}")
 
     prompt = "Generate 3 to 5 QA test-case ideas using only the pinned source text below.\n" + \
              "\n".join(f"[{source['node_id']}] {source['heading']}: {source['content']}" for source in sources)
     try:
-        cases = generate_with_retries(MockProvider(), prompt,
+        cases = generate_with_retries(llm, prompt,
                                       allowed_source_references={s["node_id"] for s in sources})
     except (ValueError, TypeError) as exc:
         raise HTTPException(502, f"Provider returned invalid structured output: {exc}") from exc
@@ -241,6 +248,9 @@ def generate(selection_id: str, provider: str | None = None, db: Session = Depen
     record = {"generation_id": generation_id, "selection_id": selection_id, "provider": selected_provider,
               "created_at": datetime.now(timezone.utc).isoformat(), "source_versions": sorted({s["version_number"] for s in sources}),
               "source_node_ids": [s["node_id"] for s in sources], "source_hashes": [s["content_hash"] for s in sources],
+              "generation_config": {"provider": selected_provider,
+                                    "model": getattr(llm, "model", None),
+                                    "timeout_seconds": getattr(llm, "timeout_seconds", None)},
               "test_cases": [c.model_dump() for c in cases]}
     JsonGenerationStore().add(record)
     return {"generation_id": generation_id, "selection_id": selection_id, "provider": selected_provider, "test_cases": cases}

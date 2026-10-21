@@ -24,11 +24,11 @@ The Swagger UI is at `http://127.0.0.1:8000/docs`. Ingest with `POST /documents/
 * `GET /documents/{document_id}/compare/{logical_node_id}?from_version=...&to_version=...` - compare versions.
 * `POST /selections` and `GET /selections/{selection_id}` - create and retrieve pinned selections.
 * `GET /selections/{selection_id}/staleness` - current/stale/removed/review-required status.
-* `POST /generations?selection_id=...&provider=mock` and `GET /generations/{generation_id}` - generate/retrieve provenance-bearing QA ideas.
+* `POST /generations?selection_id=...&provider=mock|openai_compatible` and `GET /generations/{generation_id}` - generate/retrieve provenance-bearing QA ideas.
 
 ## Configuration
 
-Copy `.env.example`. `DATABASE_URL` defaults to SQLite, and generated output uses an atomic JSON store at `data/generated.json` because no MongoDB dependency/service is assumed. JSON storage is durable but has single-process locking and should be replaced with MongoDB for multi-process production. `LLM_PROVIDER=mock` requires no key. A production provider adapter must validate structured output before storage; this repository intentionally returns 501 for an unimplemented non-mock provider.
+Copy `.env.example`. `DATABASE_URL` defaults to SQLite, and generated output uses an atomic JSON store at `data/generated.json` because no MongoDB dependency/service is assumed. JSON storage is durable but has single-process locking and should be replaced with MongoDB for multi-process production. `LLM_PROVIDER=mock` requires no key. Set `LLM_PROVIDER=openai_compatible`, `LLM_API_KEY`, `LLM_MODEL`, optional `LLM_BASE_URL`, and `LLM_TIMEOUT_SECONDS` to use the real OpenAI-compatible chat-completions provider. Responses are parsed as JSON, validated against the Pydantic schema, restricted to pinned source references, and retried three total times on malformed output or timeout.
 
 ## Testing
 
@@ -36,7 +36,7 @@ Copy `.env.example`. `DATABASE_URL` defaults to SQLite, and generated output use
 python -m unittest discover -s tests -v
 ```
 
-The suite uses deterministic mocked provider responses, temporary SQLite/JSON stores, and no external LLM calls. The HTTP workflow test uses FastAPI TestClient and can be enabled with `RUN_HTTP_TESTS=1` in an environment with a working local asyncio event loop. If the optional test dependency is installed, the same tests can also be run with `python -m pytest -q`. The supplied PDFs are regression fixtures. The implementation does not claim regulatory compliance or clinical validity.
+The suite uses deterministic mocked provider responses, temporary SQLite/JSON stores, and no external LLM calls. The in-process TestClient test is optional via `RUN_HTTP_TESTCLIENT=1`; the real HTTP workflow test launches a temporary uvicorn process via `RUN_HTTP_TESTS=1`. In the final audit, the normal suite ran 25 tests with 23 passing and 2 skipped, while the real-HTTP run passed 24 tests with 1 TestClient test skipped. If the optional test dependency is installed, the same tests can also be run with `python -m pytest -q`. The supplied PDFs are regression fixtures. The implementation does not claim regulatory compliance or clinical validity.
 
 ## End-to-end demonstration
 

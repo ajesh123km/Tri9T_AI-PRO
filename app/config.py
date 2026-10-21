@@ -13,6 +13,8 @@ class Settings:
     llm_provider: str = os.getenv("LLM_PROVIDER", "mock")
     llm_api_key: str | None = os.getenv("LLM_API_KEY") or None
     llm_model: str | None = os.getenv("LLM_MODEL") or None
+    llm_base_url: str = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1/chat/completions")
+    llm_timeout_seconds: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
     ocr_enabled: bool = os.getenv("OCR_ENABLED", "false").lower() == "true"
 
 
