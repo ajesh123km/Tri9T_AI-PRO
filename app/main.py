@@ -111,7 +111,7 @@ def ingest(file: UploadFile = File(...), db: Session = Depends(db_session)) -> d
         candidates = by_key.get((normalize(item.section_path), normalize(item.heading), item.node_type), [])
         ambiguous = len(candidates) > 1
         logical = candidates[0].logical_node if len(candidates) == 1 else LogicalNode(document_id=document.id)
-        if not candidates:
+        if len(candidates) != 1:
             db.add(logical)
             db.flush()
         parent = node_by_key.get(item.parent_key) if item.parent_key else None

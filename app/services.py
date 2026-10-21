@@ -39,7 +39,8 @@ def ingest_path(db: Session, path: str | Path, filename: str) -> dict:
     for item in parsed:
         candidates = by_key.get((normalize(item.section_path), normalize(item.heading), item.node_type), [])
         logical = candidates[0].logical_node if len(candidates) == 1 else LogicalNode(document_id=document.id)
-        if not candidates: db.add(logical); db.flush()
+        if len(candidates) != 1:
+            db.add(logical); db.flush()
         parent = node_by_key.get(item.parent_key) if item.parent_key else None
         node = VersionNode(version_id=version.id, logical_node_id=logical.id, node_key=item.node_key,
                            heading=item.heading, content=item.content, node_type=item.node_type, level=item.level,
@@ -119,8 +120,17 @@ def staleness(db: Session, selection: Selection) -> dict:
                 current = candidates[0]
             elif len(candidates) > 1 or (old and old.ambiguous_match):
                 ambiguous.append(item.logical_node_id)
+            if not current and old:
+                same_key = db.execute(select(VersionNode).where(VersionNode.version_id == latest.id)).scalars().all()
+                same_key = [node for node in same_key
+                             if normalize(node.section_path) == normalize(old.section_path)
+                             and normalize(node.heading) == normalize(old.heading)
+                             and node.node_type == old.node_type]
+                if len(same_key) > 1 or any(node.ambiguous_match for node in same_key):
+                    ambiguous.append(item.logical_node_id)
         if not current:
-            removed.append(item.logical_node_id)
+            if item.logical_node_id not in ambiguous:
+                removed.append(item.logical_node_id)
         elif current.content_hash != item.source_content_hash:
             changed.append({"logical_node_id": item.logical_node_id, "old_hash": item.source_content_hash,
                             "latest_hash": current.content_hash, "heading": current.heading})
