@@ -24,7 +24,7 @@ Matching uses normalized section path + heading + node type. A unique candidate 
 
 ## Generation and staleness
 
-The generation boundary is provider-agnostic. The bundled explicit mock produces 3 deterministic cases from exact pinned source text, validates them with Pydantic, and stores a JSON history record with selection, versions, node IDs, and hashes. Atomic replacement plus a process lock avoids partial writes; multi-process concurrency is a known limitation.
+The generation boundary is provider-agnostic. The bundled explicit mock produces 3 deterministic cases from exact pinned source text through the same bounded provider/retry wrapper used by the endpoint. Pydantic validation enforces required fields, 3-5 cases, types, non-empty values, and references limited to the pinned node IDs. Invalid output, unsupported references, and provider timeouts return controlled errors before storage. Successful output is stored as a distinct generation attempt with selection, versions, node IDs, and hashes. Atomic replacement plus a process lock avoids partial writes; multi-process concurrency is a known limitation.
 
 Staleness compares pinned hashes to the latest node with the same logical ID and reports `current`, `stale`, `source_removed`, or `review_required`. Direct source changes are distinguished from inferred impact. The current implementation leaves inferred cross-section impacts empty; it never rewrites historical cases. Identical text is not treated as proof of contextual correctness.
 
@@ -36,7 +36,7 @@ Staleness compares pinned hashes to the latest node with the same logical ID and
 
 ## Validation evidence
 
-The repository includes parser and workflow tests for the supplied PDFs, hierarchy irregularities, hashes, matching, idempotent ingestion, pinned selections, malformed provider validation, generation history, stale status, verified table cells, list completeness, parent relationships, paragraph/page boundaries, and the v1/v2 regression values. In this environment the executed command is `python -m unittest discover -s tests -v`; run `pytest -q` when pytest is installed. Run `python run_demo.py` for the full offline flow.
+The repository includes parser and workflow tests for the supplied PDFs, hierarchy irregularities, hashes, matching, idempotent ingestion, pinned selections, malformed provider validation, bounded retries, timeout handling, unsupported references, distinct generation history, stale status, verified table cells, list completeness, parent relationships, paragraph/page boundaries, and the v1/v2 regression values. The verified command is `python -m unittest discover -s tests -v` with 19 tests passing in the final review; the same tests are compatible with pytest when it is installed. `python run_demo.py` was executed successfully and reported browse, search, selection retrieval, three generated cases, provenance, changed-node comparison, and stale-selection status.
 
 This audit verifies the supplied PDFs' currently supported native-text structures. It does not establish complete extraction for arbitrary PDFs, scanned pages, figures, or tables whose geometry cannot be resolved by the PDF table finder.
 

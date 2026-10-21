@@ -26,11 +26,12 @@ def validate_cases(raw: Any, allowed_source_references: set[str] | None = None) 
     return cases
 
 
-def generate_with_retries(provider: LLMProvider, prompt: str, retries: int = 2) -> list[TestCase]:
+def generate_with_retries(provider: LLMProvider, prompt: str, retries: int = 2,
+                          allowed_source_references: set[str] | None = None) -> list[TestCase]:
     last: Exception | None = None
     for _ in range(retries + 1):
         try:
-            return validate_cases(provider.complete(prompt))
+            return validate_cases(provider.complete(prompt), allowed_source_references)
         except (ValidationError, ValueError, TypeError, TimeoutError) as exc:
             last = exc
     raise ValueError(f"LLM output remained invalid after {retries + 1} attempts: {last}")

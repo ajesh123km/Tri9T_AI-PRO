@@ -13,7 +13,7 @@ from .models import Document, DocumentVersion, LogicalNode, Selection, Selection
 from .parser import normalize, parse_pdf
 from .schemas import GenerationOut, NodeOut, SelectionIn, VersionOut
 from .services import JsonGenerationStore, build_mock_cases, selection_content, staleness
-from .llm import validate_cases
+from .llm import generate_with_retries
 
 app = FastAPI(title="Tri9T AI CT-200 Document QA Service", version="0.1.0")
 
@@ -224,9 +224,17 @@ def generate(selection_id: str, provider: str | None = None, db: Session = Depen
     selected_provider = provider or settings.llm_provider
     if selected_provider != "mock":
         raise HTTPException(501, "Only explicit mock provider is bundled; configure an LLM adapter for production")
+
+    class MockProvider:
+        name = "mock"
+        def complete(self, prompt: str):
+            return [case.model_dump() for case in build_mock_cases(sources)]
+
+    prompt = "Generate 3 to 5 QA test-case ideas using only the pinned source text below.\n" + \
+             "\n".join(f"[{source['node_id']}] {source['heading']}: {source['content']}" for source in sources)
     try:
-        cases = validate_cases([c.model_dump() for c in build_mock_cases(sources)],
-                               allowed_source_references={s["node_id"] for s in sources})
+        cases = generate_with_retries(MockProvider(), prompt,
+                                      allowed_source_references={s["node_id"] for s in sources})
     except (ValueError, TypeError) as exc:
         raise HTTPException(502, f"Provider returned invalid structured output: {exc}") from exc
     generation_id = str(uuid4())

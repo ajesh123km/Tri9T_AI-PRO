@@ -33,8 +33,27 @@ Copy `.env.example`. `DATABASE_URL` defaults to SQLite, and generated output use
 ## Testing
 
 ```powershell
-pytest -q
+python -m unittest discover -s tests -v
 ```
 
-Tests use temporary SQLite/JSON stores and no external LLM calls. The supplied PDFs are regression fixtures. The implementation does not claim regulatory compliance or clinical validity.
+The suite uses deterministic mocked provider responses, temporary SQLite/JSON stores, and no external LLM calls. If the optional test dependency is installed, the same tests can also be run with `python -m pytest -q`. The supplied PDFs are regression fixtures. The implementation does not claim regulatory compliance or clinical validity.
+
+## End-to-end demonstration
+
+```powershell
+python run_demo.py
+```
+
+The demonstration ingests v1 and v2, browses and searches v1, creates and retrieves a pinned selection, generates and retrieves three explicitly mocked QA cases with provenance, compares the battery-life node across versions, and reports the v1 selection's v2 staleness status.
+
+Example API requests after starting the server:
+
+```powershell
+curl.exe -F "file=@ct200_manual.pdf" http://127.0.0.1:8000/documents/ingest
+curl.exe -F "file=@ct200_manual_v2.pdf" http://127.0.0.1:8000/documents/ingest
+curl.exe "http://127.0.0.1:8000/documents/{document_id}/sections"
+curl.exe "http://127.0.0.1:8000/documents/{document_id}/search?q=battery"
+curl.exe -X POST "http://127.0.0.1:8000/generations?selection_id={selection_id}&provider=mock"
+curl.exe "http://127.0.0.1:8000/selections/{selection_id}/staleness"
+```
 

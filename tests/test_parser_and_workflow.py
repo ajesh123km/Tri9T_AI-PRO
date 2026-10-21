@@ -246,8 +246,7 @@ class GenerationPipelineRegressionTests(unittest.TestCase):
 
     def test_invalid_api_output_is_not_stored(self):
         store = JsonGenerationStore(self.store_path)
-        with patch.object(main, "build_mock_cases", return_value=[]), \
-             patch.object(main, "validate_cases", side_effect=ValueError("invalid output")), \
+        with patch.object(main, "generate_with_retries", side_effect=ValueError("invalid output")), \
              patch.object(main, "JsonGenerationStore", return_value=store):
             with self.assertRaises(HTTPException) as raised:
                 main.generate(self.selection.id, provider="mock", db=self.db)
@@ -264,4 +263,12 @@ class GenerationPipelineRegressionTests(unittest.TestCase):
         self.assertEqual(record["source_node_ids"], [item.logical_node_id for item in self.selection.items])
         self.assertEqual(record["source_hashes"], [item.source_content_hash for item in self.selection.items])
         self.assertEqual(result["generation_id"], record["generation_id"])
+
+    def test_repeated_generation_requests_preserve_distinct_history(self):
+        store = JsonGenerationStore(self.store_path)
+        with patch.object(main, "JsonGenerationStore", return_value=store):
+            first = main.generate(self.selection.id, provider="mock", db=self.db)
+            second = main.generate(self.selection.id, provider="mock", db=self.db)
+        self.assertNotEqual(first["generation_id"], second["generation_id"])
+        self.assertEqual(len(store._read()), 2)
 
