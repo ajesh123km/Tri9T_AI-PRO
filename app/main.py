@@ -225,7 +225,8 @@ def generate(selection_id: str, provider: str | None = None, db: Session = Depen
     if selected_provider != "mock":
         raise HTTPException(501, "Only explicit mock provider is bundled; configure an LLM adapter for production")
     try:
-        cases = validate_cases([c.model_dump() for c in build_mock_cases(sources)])
+        cases = validate_cases([c.model_dump() for c in build_mock_cases(sources)],
+                               allowed_source_references={s["node_id"] for s in sources})
     except (ValueError, TypeError) as exc:
         raise HTTPException(502, f"Provider returned invalid structured output: {exc}") from exc
     generation_id = str(uuid4())

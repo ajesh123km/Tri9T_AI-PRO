@@ -3,7 +3,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from uuid import uuid4
 
+from fastapi import HTTPException
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -11,7 +14,9 @@ from sqlalchemy.pool import StaticPool
 from app.db import Base
 from app.models import Selection, SelectionItem, VersionNode
 from app.parser import normalize, parse_pdf
-from app.services import ingest_path, staleness
+from app.schemas import TestCase
+from app.services import JsonGenerationStore, ingest_path, staleness
+from app import main
 
 
 ROOT = Path(__file__).parents[1]
@@ -161,4 +166,102 @@ class VersionIngestionRegressionTests(unittest.TestCase):
             current = self._node(db.execute(select(VersionNode).where(VersionNode.version_id == v2["version_id"])).scalars().all(), "2.1.1.1 battery")
             self.assertTrue(current.ambiguous_match)
             self.assertEqual(staleness(db, selection)["status"], "review_required")
+
+
+class GenerationPipelineRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        Base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine, expire_on_commit=False)
+        self.db = self.Session()
+        result = ingest_path(self.db, ROOT / "ct200_manual.pdf", "ct200_manual.pdf")
+        nodes = self.db.execute(select(VersionNode).where(VersionNode.version_id == result["version_id"],
+                                                            VersionNode.node_type == "section")).scalars().all()
+        self.selection = Selection(document_id=result["document_id"], name="generation audit")
+        for node in nodes[:3]:
+            self.selection.items.append(SelectionItem(version_id=result["version_id"], logical_node_id=node.logical_node_id,
+                                                      version_node_id=node.id, source_content_hash=node.content_hash))
+        self.db.add(self.selection)
+        self.db.commit()
+        self.store_path = ROOT / "tmp" / f"generation-audit-{uuid4()}.json"
+
+    def tearDown(self):
+        self.db.close()
+        self.engine.dispose()
+        self.store_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _valid_case(ref="node-1"):
+        return {"title": "Verify requirement", "source_references": [ref],
+                "preconditions": ["Device is ready"], "test_steps": ["Run the check"],
+                "expected_result": "The requirement is met", "priority": "medium",
+                "rationale": "Directly derived from the source"}
+
+    def test_malformed_json_is_retried_and_rejected(self):
+        from app.llm import generate_with_retries
+        class Provider:
+            name = "fake"
+            def __init__(self): self.calls = 0
+            def complete(self, prompt): self.calls += 1; return "{not-json"
+        provider = Provider()
+        with self.assertRaises(ValueError): generate_with_retries(provider, "prompt", retries=2)
+        self.assertEqual(provider.calls, 3)
+
+    def test_missing_fields_are_rejected(self):
+        from app.llm import validate_cases
+        case = self._valid_case()
+        del case["expected_result"]
+        with self.assertRaises(Exception): validate_cases([case, self._valid_case(), self._valid_case()])
+
+    def test_wrong_data_types_are_rejected(self):
+        from app.llm import validate_cases
+        case = self._valid_case()
+        case["title"] = 42
+        with self.assertRaises(Exception): validate_cases([case, self._valid_case(), self._valid_case()])
+
+    def test_case_count_must_be_between_three_and_five(self):
+        from app.llm import validate_cases
+        with self.assertRaises(ValueError): validate_cases([self._valid_case(), self._valid_case()])
+        with self.assertRaises(ValueError): validate_cases([self._valid_case() for _ in range(6)])
+
+    def test_timeout_is_retried_and_becomes_controlled_failure(self):
+        from app.llm import generate_with_retries
+        class Provider:
+            name = "timeout"
+            def __init__(self): self.calls = 0
+            def complete(self, prompt): self.calls += 1; raise TimeoutError("provider timed out")
+        provider = Provider()
+        with self.assertRaises(ValueError): generate_with_retries(provider, "prompt", retries=2)
+        self.assertEqual(provider.calls, 3)
+
+    def test_unsupported_source_reference_is_api_error_and_not_stored(self):
+        cases = [self._valid_case("not-selected") for _ in range(3)]
+        store = JsonGenerationStore(self.store_path)
+        with patch.object(main, "build_mock_cases", return_value=[TestCase.model_validate(c) for c in cases]), \
+             patch.object(main, "JsonGenerationStore", return_value=store):
+            with self.assertRaises(HTTPException) as raised:
+                main.generate(self.selection.id, provider="mock", db=self.db)
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(store._read(), [])
+
+    def test_invalid_api_output_is_not_stored(self):
+        store = JsonGenerationStore(self.store_path)
+        with patch.object(main, "build_mock_cases", return_value=[]), \
+             patch.object(main, "validate_cases", side_effect=ValueError("invalid output")), \
+             patch.object(main, "JsonGenerationStore", return_value=store):
+            with self.assertRaises(HTTPException) as raised:
+                main.generate(self.selection.id, provider="mock", db=self.db)
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(store._read(), [])
+
+    def test_success_preserves_selection_provenance(self):
+        store = JsonGenerationStore(self.store_path)
+        with patch.object(main, "JsonGenerationStore", return_value=store):
+            result = main.generate(self.selection.id, provider="mock", db=self.db)
+        record = store._read()[0]
+        self.assertEqual(record["selection_id"], self.selection.id)
+        self.assertEqual(record["source_versions"], [1])
+        self.assertEqual(record["source_node_ids"], [item.logical_node_id for item in self.selection.items])
+        self.assertEqual(record["source_hashes"], [item.source_content_hash for item in self.selection.items])
+        self.assertEqual(result["generation_id"], record["generation_id"])
 
